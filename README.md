@@ -1,106 +1,209 @@
-# API Gateway Documentation
+<div align="center">
 
-A production-style Node.js + Express API Gateway that exposes a single entry point for multiple external APIs:
-- Weather (OpenWeatherMap)
-- News (NewsAPI)
-- Crypto (CoinGecko)
+# ⚡ API Gateway
 
-It includes:
-- Route-based API forwarding
-- API Key + JWT authentication
-- SQLite-backed API key management and request logging
-- Redis response caching (optional but recommended)
-- Rate limiting
-- Aggregated dashboard endpoint
-- Structured logging via Winston
+### A production-grade Node.js gateway that unifies multiple third-party APIs behind a single authenticated, cached, and rate-limited endpoint.
 
----
+[![Node.js](https://img.shields.io/badge/Node.js-18+-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
+[![Express](https://img.shields.io/badge/Express-4.x-000000?style=flat-square&logo=express&logoColor=white)](https://expressjs.com)
+[![React](https://img.shields.io/badge/React-Frontend-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev)
+[![SQLite](https://img.shields.io/badge/SQLite-Database-003B57?style=flat-square&logo=sqlite&logoColor=white)](https://sqlite.org)
+[![Redis](https://img.shields.io/badge/Redis-Caching-DC382D?style=flat-square&logo=redis&logoColor=white)](https://redis.io)
+[![JWT](https://img.shields.io/badge/JWT-Auth-000000?style=flat-square&logo=jsonwebtokens&logoColor=white)](https://jwt.io)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 
-## 1) Project Overview
-
-This gateway lets clients call one service and get data from different providers without integrating each provider directly.
-
-### Primary Endpoints
-- `GET /weather?city=London`
-- `GET /news?topic=technology`
-- `GET /crypto?symbol=BTC`
-- `GET /dashboard?city=London&crypto=BTC&topic=technology` (aggregation)
-
-### Public Endpoint
-- `GET /health`
-
-### Auth & Admin Endpoints
-- `POST /auth/token`
-- `POST /auth/keys`
-- `GET /auth/keys`
-- `GET /auth/logs`
+</div>
 
 ---
 
-## 2) Tech Stack
+## What is this?
 
-- **Runtime:** Node.js
-- **Framework:** Express
-- **Database:** SQLite (`better-sqlite3`)
-- **Caching:** Redis (`ioredis`)
-- **Auth:** API key + JWT (`jsonwebtoken`)
-- **HTTP Client:** Axios
-- **Logging:** Winston + Morgan
+Most applications that consume multiple third-party APIs end up with scattered integration logic, duplicated auth handling, inconsistent error formats, and no caching strategy. This project solves that by introducing a **single gateway layer** that every client talks to — regardless of which upstream provider it needs.
+
+Clients send one authenticated request. The gateway handles auth validation, rate limiting, cache lookup, upstream forwarding, response logging, and error normalisation — then returns a consistent JSON response. Upstream API details are completely hidden from the client.
 
 ---
 
-## 3) Project Structure
+## Architecture
 
-```txt
-API Gateway/
+```
+                         ┌─────────────────────────────────────────────────────┐
+                         │                    API Gateway                      │
+                         │                                                     │
+  React Frontend  ──────▶│  Auth MW  ──▶  Rate Limiter  ──▶  Cache (Redis)   │
+  (or any client)        │                                        │            │
+                         │                                        ▼            │
+                         │                                    Router           │
+                         │                               ┌──────┼──────┐      │
+                         │                               ▼      ▼      ▼      │
+                         │                           Weather  News  Crypto    │
+                         │                           Service  Svc   Service   │
+                         │                               │      │      │      │
+                         └───────────────────────────────┼──────┼──────┼──────┘
+                                                         ▼      ▼      ▼
+                                                    OpenWX  NewsAPI CoinGecko
+                                                    
+                         ┌─────────────┐    ┌──────────────┐    ┌────────────┐
+                         │   SQLite    │    │    Redis     │    │  Winston   │
+                         │  API keys  │    │  Response    │    │  Logging   │
+                         │  Req logs  │    │  Cache TTL   │    │  + Morgan  │
+                         └─────────────┘    └──────────────┘    └────────────┘
+```
+
+### Why this architecture?
+
+**Middleware pipeline** — Auth, rate limiting, and caching are implemented as Express middleware in a deliberate order. Auth runs first so unauthenticated requests never touch the rate limiter or cache. The rate limiter runs second to reject over-quota requests before any expensive operations. The cache runs last in the pipeline — a hit returns immediately without invoking any service logic.
+
+**Dual authentication** — API keys are the long-lived credentials stored in SQLite. They are used to generate short-lived JWTs, which are what clients actually send on every request. This means raw API keys are never transmitted repeatedly, and token expiry provides a natural revocation window without invalidating the underlying key.
+
+**SQLite for key management and logging** — API key storage and request logging are write-light, read-light workloads that don't benefit from the operational complexity of a full RDBMS. SQLite runs in-process, has zero network latency, and its file-based nature makes it trivial to inspect and back up. The tradeoff (no horizontal write scaling) is irrelevant for this use case.
+
+**Redis as an optional dependency** — the cache layer checks for Redis availability at startup. If Redis is unreachable, the gateway continues serving all requests without caching. This means Redis failure never causes gateway downtime — it only degrades cache performance. Upstream APIs absorb the extra load, which is the correct graceful degradation behaviour.
+
+**Service layer isolation** — each upstream integration (weather, news, crypto) lives in its own service module. Routes don't call Axios directly. This means changing a provider (e.g. swapping NewsAPI for a different news source) requires touching exactly one file and nothing else.
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Reason |
+|---|---|---|
+| Runtime | Node.js 18+ | Native fetch, stable ESM, long-term support |
+| Framework | Express 4 | Minimal, composable, widely understood middleware model |
+| Database | SQLite via `better-sqlite3` | Zero-config, in-process, synchronous API suits low-concurrency admin ops |
+| Caching | Redis via `ioredis` | Sub-millisecond TTL-based cache, optional with auto-fallback |
+| Auth | `jsonwebtoken` | Stateless JWT — no session store needed for protected routes |
+| HTTP client | Axios | Interceptors, timeout config, consistent error shape across providers |
+| Logging | Winston + Morgan | Structured JSON logs (Winston) + per-request HTTP logs (Morgan) |
+| Frontend | React | Interactive live API explorer with real-time request tracing |
+
+---
+
+## Project Structure
+
+```
+api-gateway/
+├── frontend/                   # React frontend (interactive demo UI)
 ├── src/
 │   ├── config/
-│   │   └── index.js
+│   │   └── index.js            # Centralised env config with validation
 │   ├── db/
-│   │   ├── database.js
-│   │   ├── repositories.js
-│   │   └── seed.js
+│   │   ├── database.js         # SQLite initialisation, table creation
+│   │   ├── repositories.js     # All DB queries (createApiKey, logRequest, etc.)
+│   │   └── seed.js             # Seeds initial API keys on first run
 │   ├── middleware/
-│   │   ├── auth.js
-│   │   ├── cache.js
-│   │   ├── rateLimiter.js
-│   │   └── requestLogger.js
+│   │   ├── auth.js             # JWT verification + API key lookup
+│   │   ├── cache.js            # Redis get/set with TTL, graceful miss handling
+│   │   ├── rateLimiter.js      # Per-key sliding window rate limiting
+│   │   └── requestLogger.js    # Writes each request to SQLite via repository
 │   ├── routes/
-│   │   ├── auth.js
-│   │   ├── crypto.js
-│   │   ├── dashboard.js
-│   │   ├── news.js
-│   │   └── weather.js
+│   │   ├── auth.js             # POST /auth/token, POST|GET /auth/keys, GET /auth/logs
+│   │   ├── weather.js          # GET /weather
+│   │   ├── news.js             # GET /news
+│   │   ├── crypto.js           # GET /crypto
+│   │   └── dashboard.js        # GET /dashboard (aggregation via Promise.all)
 │   ├── services/
-│   │   ├── cryptoService.js
-│   │   ├── newsService.js
-│   │   └── weatherService.js
+│   │   ├── weatherService.js   # OpenWeatherMap integration
+│   │   ├── newsService.js      # NewsAPI integration
+│   │   └── cryptoService.js    # CoinGecko integration
 │   ├── utils/
-│   │   └── logger.js
-│   └── server.js
-├── .env
+│   │   └── logger.js           # Winston instance (file + console transports)
+│   └── server.js               # Express app bootstrap, middleware registration
 ├── .env.example
-├── gateway.db
+├── gateway.db                  # SQLite database file (auto-created)
 ├── package.json
 └── README.md
 ```
 
 ---
 
-## 4) Prerequisites
+## API Reference
 
-- Node.js 18+
-- npm 9+
-- Redis server (optional; without Redis, caching is auto-disabled)
-- API keys:
-  - OpenWeatherMap key
-  - NewsAPI key
+### Public
+
+```
+GET /health
+```
+Returns gateway status and uptime. No authentication required.
 
 ---
 
-## 5) Environment Variables
+### Authentication
 
-Copy `.env.example` to `.env` and fill real values:
+```
+POST /auth/token
+Content-Type: application/json
+
+{ "apiKey": "your-api-key" }
+```
+Returns a signed JWT valid for subsequent requests.
+
+```
+POST /auth/keys          # Create a new API key (admin)
+GET  /auth/keys          # List all API keys (admin)
+GET  /auth/logs          # View all request logs (admin)
+```
+
+---
+
+### Protected Endpoints
+
+All requests below require:
+```
+Authorization: Bearer <jwt>
+```
+
+```
+GET /weather?city=London
+GET /news?topic=technology
+GET /crypto?symbol=BTC
+GET /dashboard?city=London&topic=technology&crypto=BTC
+```
+
+The `/dashboard` endpoint fires all three upstream requests in parallel using `Promise.all` and returns a unified response — one round-trip instead of three.
+
+---
+
+### Example: full flow with curl
+
+```bash
+# 1. Get a token
+TOKEN=$(curl -s -X POST http://localhost:3000/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"apiKey":"your-key-here"}' | jq -r '.token')
+
+# 2. Call a protected endpoint
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:3000/dashboard?city=London&crypto=BTC&topic=technology"
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js 18+
+- npm 9+
+- Redis (optional — caching auto-disables if unavailable)
+- An [OpenWeatherMap](https://openweathermap.org/api) API key
+- A [NewsAPI](https://newsapi.org) API key
+
+### Installation
+
+```bash
+git clone https://github.com/faruqer/api-gateway.git
+cd api-gateway
+npm install
+```
+
+### Configuration
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env`:
 
 ```env
 PORT=3000
@@ -108,8 +211,8 @@ NODE_ENV=development
 
 JWT_SECRET=your-super-secret-jwt-key-change-me
 
-OPENWEATHERMAP_API_KEY=your_openweathermap_api_key
-NEWSAPI_API_KEY=your_newsapi_api_key
+OPENWEATHERMAP_API_KEY=your_key_here
+NEWSAPI_API_KEY=your_key_here
 
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
@@ -123,452 +226,50 @@ CACHE_TTL_NEWS=300
 CACHE_TTL_CRYPTO=60
 ```
 
----
-
-## 6) Installation & Run
+### Run
 
 ```bash
-npm install
+# Seed the database with an initial API key
 npm run seed
+
+# Start with hot reload
 npm run dev
-```
 
-Alternative (without nodemon):
-
-```bash
+# Or production start
 npm start
 ```
 
-The service runs on:
-- `http://localhost:3000`
+Gateway runs at `http://localhost:3000`.
 
----
-
-## 7) Database (SQLite)
-
-The gateway uses `gateway.db` with these tables:
-
-### `api_keys`
-- `id` (PK)
-- `key` (unique)
-- `owner`
-- `active` (1/0)
-- `created_at`
-
-### `request_logs`
-- `id` (PK)
-- `api_key`
-- `method`
-- `path`
-- `query`
-- `status_code`
-- `response_time_ms`
-- `ip`
-- `error`
-- `created_at`
-
-The `seed` script creates initial API keys for testing.
-
----
-
-## 8) Authentication
-
-Two supported auth modes:
-
-### A) API Key (default)
-Send header:
-- `x-api-key: <your-api-key>`
-
-### B) JWT Bearer Token
-1. Exchange API key for JWT at `POST /auth/token`
-2. Send header:
-   - `Authorization: Bearer <token>`
-
-### Auth Behavior
-- `/health` is public
-- `/auth/token` is public (requires API key in body)
-- All business routes (`/weather`, `/news`, `/crypto`, `/dashboard`) require auth
-
----
-
-## 9) Rate Limiting
-
-- Default: **60 requests per minute** per API key/IP
-- Configurable via:
-  - `RATE_LIMIT_WINDOW_MS`
-  - `RATE_LIMIT_MAX_REQUESTS`
-
-Response headers:
-- `X-RateLimit-Limit`
-- `X-RateLimit-Remaining`
-- `X-RateLimit-Reset`
-
-On limit exceeded:
-- HTTP `429 Too Many Requests`
-- `Retry-After` header
-
----
-
-## 10) Caching (Redis)
-
-Redis caching is route-level middleware.
-
-Default TTLs:
-- Weather: 300s
-- News: 300s
-- Crypto: 60s
-
-If Redis is unavailable:
-- Gateway continues normally
-- Caching is disabled gracefully
-
----
-
-## 11) Logging & Monitoring
-
-### Request Logging
-Every request (after auth layer) is logged to:
-- SQLite `request_logs`
-- Winston log files
-
-### Log Files
-- `logs/combined.log`
-- `logs/error.log`
-
-### Runtime Logs
-Morgan prints concise HTTP logs in development.
-
----
-
-## 12) API Reference
-
-## 12.1 Health
-
-### `GET /health`
-Public health endpoint.
-
-**Response 200**
-```json
-{
-  "status": "ok",
-  "uptime": 12.34
-}
-```
-
----
-
-## 12.2 Auth
-
-### `POST /auth/token`
-Create JWT from API key.
-
-**Request body**
-```json
-{
-  "apiKey": "<existing-api-key>"
-}
-```
-
-**Response 200**
-```json
-{
-  "token": "<jwt>",
-  "expiresIn": "24h"
-}
-```
-
-**Errors**
-- `400` missing `apiKey`
-- `403` invalid/inactive API key
-
----
-
-### `POST /auth/keys`
-Create a new API key (requires auth).
-
-Headers:
-- `x-api-key` or `Authorization: Bearer ...`
-
-**Request body**
-```json
-{
-  "owner": "my-client-app"
-}
-```
-
-**Response 201**
-```json
-{
-  "key": "<uuid>",
-  "owner": "my-client-app"
-}
-```
-
----
-
-### `GET /auth/keys`
-List API keys (requires auth).
-
-**Response 200**
-```json
-{
-  "keys": [
-    {
-      "id": 1,
-      "key": "...",
-      "owner": "test-user",
-      "active": 1,
-      "created_at": "2026-02-27 07:00:00"
-    }
-  ]
-}
-```
-
----
-
-### `GET /auth/logs?limit=50`
-Get recent request logs (requires auth).
-
-**Response 200**
-```json
-{
-  "logs": [
-    {
-      "id": 1,
-      "api_key": "...",
-      "method": "GET",
-      "path": "/crypto",
-      "status_code": 200,
-      "response_time_ms": 120.5,
-      "created_at": "2026-02-27 07:00:00"
-    }
-  ]
-}
-```
-
----
-
-## 12.3 Business Endpoints
-
-All endpoints below require authentication.
-
-### `GET /weather?city=London`
-Fetch weather from OpenWeatherMap.
-
-**Response 200**
-```json
-{
-  "source": "openweathermap",
-  "data": {
-    "city": "London",
-    "country": "GB",
-    "temperature": 10.2,
-    "feelsLike": 8.3,
-    "humidity": 71,
-    "description": "light rain",
-    "windSpeed": 4.5,
-    "icon": "10d"
-  }
-}
-```
-
----
-
-### `GET /news?topic=technology&pageSize=5`
-Fetch recent topic news from NewsAPI.
-
-**Response 200**
-```json
-{
-  "source": "newsapi",
-  "data": {
-    "topic": "technology",
-    "totalResults": 123,
-    "articles": [
-      {
-        "title": "...",
-        "source": "TechCrunch",
-        "url": "https://...",
-        "publishedAt": "2026-02-27T06:00:00Z",
-        "description": "..."
-      }
-    ]
-  }
-}
-```
-
----
-
-### `GET /crypto?symbol=BTC`
-Fetch crypto price from CoinGecko.
-
-**Response 200**
-```json
-{
-  "source": "coingecko",
-  "data": {
-    "symbol": "BTC",
-    "coinId": "bitcoin",
-    "priceUsd": 67561,
-    "change24h": -0.84,
-    "marketCapUsd": 1350534500640.59
-  }
-}
-```
-
-**Errors**
-- `400` missing `symbol`
-- `404` symbol not found
-
----
-
-### `GET /dashboard?city=London&crypto=BTC&topic=technology`
-Aggregate multiple providers in one response.
-
-Query params are optional individually, but at least one is required.
-
-**Response 200**
-```json
-{
-  "data": {
-    "weather": { "...": "..." },
-    "crypto": { "...": "..." },
-    "news": { "...": "..." }
-  },
-  "errors": {
-    "weather": "Invalid API key"
-  }
-}
-```
-
-Notes:
-- Partial failures do not fail the whole request.
-- Successful sections are returned in `data`; failed sections appear in `errors`.
-
----
-
-## 13) cURL Examples
-
-Set API key once:
+### Frontend
 
 ```bash
-export API_KEY=<your-api-key>
-```
-
-### Health
-```bash
-curl http://localhost:3000/health
-```
-
-### Crypto
-```bash
-curl -H "x-api-key: $API_KEY" "http://localhost:3000/crypto?symbol=BTC"
-```
-
-### Weather
-```bash
-curl -H "x-api-key: $API_KEY" "http://localhost:3000/weather?city=London"
-```
-
-### News
-```bash
-curl -H "x-api-key: $API_KEY" "http://localhost:3000/news?topic=technology"
-```
-
-### Dashboard
-```bash
-curl -H "x-api-key: $API_KEY" "http://localhost:3000/dashboard?city=London&crypto=BTC&topic=technology"
-```
-
-### Get JWT
-```bash
-curl -X POST http://localhost:3000/auth/token \
-  -H "Content-Type: application/json" \
-  -d '{"apiKey":"'$API_KEY'"}'
-```
-
-### JWT-authenticated call
-```bash
-curl -H "Authorization: Bearer <jwt>" "http://localhost:3000/crypto?symbol=ETH"
+cd frontend
+npm install
+npm run dev
 ```
 
 ---
 
-## 14) PowerShell Examples (Windows)
+## Key Design Decisions
 
-```powershell
-$apiKey = "<your-api-key>"
-Invoke-RestMethod -Uri "http://localhost:3000/crypto?symbol=BTC" -Headers @{"x-api-key"=$apiKey}
-```
+**Why not use an existing API gateway (Kong, AWS API Gateway, etc.)?**
+Those tools are operationally heavy for a project of this scope. Building it from scratch demonstrates understanding of what gateways actually do — auth pipelines, cache strategies, rate limiting algorithms — rather than just configuration.
 
-Get JWT and call with bearer token:
+**Why synchronous `better-sqlite3` instead of an async driver?**
+API key lookups and request logging are low-frequency, low-contention operations. The synchronous API is simpler, avoids promise chains in middleware, and performs identically to async drivers at this concurrency level. For a high-throughput multi-instance deployment, migrating to `pg` (PostgreSQL) with a connection pool would be the natural next step.
 
-```powershell
-$body = @{ apiKey = $apiKey } | ConvertTo-Json
-$tokenResp = Invoke-RestMethod -Uri "http://localhost:3000/auth/token" -Method POST -ContentType "application/json" -Body $body
-$token = $tokenResp.token
-Invoke-RestMethod -Uri "http://localhost:3000/crypto?symbol=ETH" -Headers @{ Authorization = "Bearer $token" }
-```
+**Why two auth layers (API key + JWT)?**
+API keys alone require a DB lookup on every request. JWTs are stateless and verifiable without I/O. The two-layer design means the hot path (JWT verification) has zero DB cost, while the cold path (key-to-token exchange) pays the SQLite lookup once per session.
 
 ---
 
-## 15) Error Handling
+## Author
 
-Common status codes:
-- `400` bad input (missing query/body values)
-- `401` missing auth
-- `403` invalid API key
-- `404` route/symbol not found
-- `429` rate limit exceeded
-- `5xx` upstream or internal errors
-
-All errors are JSON with an `error` field.
+Built by [@faruqer](https://github.com/faruqer)
 
 ---
 
-## 16) Troubleshooting
-
-### Redis connection refused
-If you see `ECONNREFUSED 127.0.0.1:6379`, Redis is not running.
-- Start Redis locally
-- Or ignore for local testing (gateway still works without cache)
-
-### Weather/News failing with API key errors
-Set real keys in `.env`:
-- `OPENWEATHERMAP_API_KEY`
-- `NEWSAPI_API_KEY`
-
-### 401 Unauthorized
-Add one auth header:
-- `x-api-key: ...`
-- or `Authorization: Bearer ...`
-
-### 429 Too Many Requests
-Wait for rate-limit window reset or increase limits in `.env`.
-
----
-
-## 17) Security Notes
-
-- Rotate API keys regularly.
-- Use strong `JWT_SECRET` in production.
-- Put gateway behind HTTPS and reverse proxy.
-- Move in-memory rate limiter to Redis for multi-instance deployments.
-- Restrict admin/auth routes via role checks if needed.
-
----
-
-## 18) Future Improvements
-
-- Redis-backed distributed rate limiting
-- Request validation (Joi/Zod)
-- OpenAPI/Swagger docs endpoint
-- Unit/integration tests
-- Circuit breaker/retry policies for upstream APIs
-- Role-based access control for key management
-
----
-
-## 19) License
+## License
 
 MIT
